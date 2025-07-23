@@ -1,0 +1,11 @@
+pip install transformers
+pip install peft
+pip install datasets
+pip install huggingface_hub
+pip install torch
+pip install accelerate
+pip install scipy
+pip install scikit-learn
+pip install tqdm
+pip install langchain
+pip install langchain_ollama
