@@ -1,0 +1,457 @@
+import sys
+import json
+import os
+import uuid
+import html
+import re
+from functools import partial
+
+from PyQt5.QtWidgets import (
+    QApplication,
+    QWidget,
+    QVBoxLayout,
+    QTextEdit,
+    QLineEdit,
+    QPushButton,
+    QLabel,
+    QHBoxLayout,
+    QListWidget,
+    QListWidgetItem,
+    QMessageBox,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt5.QtGui import QTextCursor
+
+from pyra_ai import generate_response, clean_model_reply, remove_redundant_opening
+ROOT = os.path.dirname(os.path.abspath(__file__))
+SESSIONS_PATH = os.path.join(ROOT, "saved_conversations.json")
+
+
+class ConversationManager:
+    """Simple JSON-backed storage for conversations.
+
+    File format:
+    {
+      "sessions": [
+         {"id": "...", "title": "...", "history": [[user, bot], ...]},
+         ...
+      ],
+      "last_active_id": "..." | null
+    }
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.sessions = []
+        self.last_active_id = None
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.sessions = data.get("sessions", [])
+                self.last_active_id = data.get("last_active_id")
+            except Exception:
+                self.sessions = []
+                self.last_active_id = None
+        else:
+            self.sessions = []
+            self.last_active_id = None
+
+    def save(self):
+        data = {
+            "sessions": self.sessions,
+            "last_active_id": self.last_active_id,
+        }
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def create_session(self, title: str = "New conversation"):
+        sid = str(uuid.uuid4())
+        session = {"id": sid, "title": title, "history": []}
+        self.sessions.insert(0, session)
+        self.last_active_id = sid
+        self.save()
+        return session
+
+    def find_session(self, sid: str):
+        for s in self.sessions:
+            if s.get("id") == sid:
+                return s
+        return None
+
+    def upsert_history(self, sid: str, history):
+        s = self.find_session(sid)
+        if s is not None:
+            s["history"] = history
+            self.save()
+
+    def update_title(self, sid: str, title: str):
+        s = self.find_session(sid)
+        if s is not None:
+            s["title"] = title
+            self.save()
+
+    def delete_session(self, sid: str) -> bool:
+        if not sid:
+            return False
+        removed = False
+        remaining = []
+        for session in self.sessions:
+            if session.get("id") == sid:
+                removed = True
+                continue
+            remaining.append(session)
+        if not removed:
+            return False
+        self.sessions = remaining
+        if self.last_active_id == sid:
+            self.last_active_id = self.sessions[0]["id"] if self.sessions else None
+        self.save()
+        return True
+
+
+def _format_numbered_list_html(text: str) -> str:
+    if not text:
+        return ""
+    marker = re.compile(r"(?:(?<=^)|(?<=\s))\d{1,2}\.\s")
+    matches = list(marker.finditer(text))
+    if len(matches) < 2:
+        return ""
+    first = matches[0]
+    if not text[first.start():].lstrip().startswith("1. "):
+        return ""
+
+    parts = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        seg = text[start:end]
+        seg = re.sub(r"^\s*\d{1,2}\.\s", "", seg)
+        seg = seg.strip()
+        if seg:
+            parts.append(html.escape(seg))
+    if not parts:
+        return ""
+
+    lines = "<br/>".join(f"<span style='color:#000000'>• {p}</span>" for p in parts)
+    return f"<div style='margin:4px 0 0 18px;'>{lines}</div>"
+
+
+def _format_reply_html(text: str) -> str:
+    list_html = _format_numbered_list_html(text)
+    if list_html:
+        return list_html
+    return f"<span style='color:#000000'>{html.escape(text)}</span>"
+
+
+class Worker(QThread):
+    done = pyqtSignal(str)
+
+    def __init__(self, user_text, history):
+        super().__init__()
+        self.user_text = user_text
+        self.history = list(history)
+
+    def run(self):
+        try:
+            reply = generate_response(self.user_text, self.history)
+        except Exception as e:
+            reply = f"Error generating response: {e}"
+        self.done.emit(reply)
+
+
+class PyraApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pyra - AI Nurse Advisor")
+        self.resize(900, 700)
+        self.history = []
+        self.in_progress_question = None
+
+        self.session_mgr = ConversationManager(SESSIONS_PATH)
+        if not self.session_mgr.sessions:
+            self.current_session = self.session_mgr.create_session()
+        else:
+            sid = self.session_mgr.last_active_id or self.session_mgr.sessions[0]["id"]
+            self.current_session = self.session_mgr.find_session(sid) or self.session_mgr.sessions[0]
+        self.history = list(self.current_session.get("history", []))
+
+        root = QHBoxLayout()
+
+        self.setStyleSheet(
+            "QWidget { background-color: #C7E3BF; color: #111111; }"
+            "QTextEdit { background-color: #C7E3BF; color: #111111; }"
+            "QLineEdit { background-color: #C7E3BF; color: #111111; }"
+            "QPushButton { background-color: #FFFFFF; color: #111111; border: 1px solid #cccccc; padding: 6px; }"
+            "QLabel { color: #111111; }"
+            "QListWidget { background-color: #C7E3BF; color: #111111; border: 1px solid #cccccc; }"
+        )
+
+        sidebar = QVBoxLayout()
+        side_label = QLabel("Conversations")
+        side_label.setStyleSheet("font-weight: bold;")
+        self.session_list = QListWidget()
+        self.session_list.setStyleSheet(
+            "QListWidget { background-color: #C7E3BF; color: #111111; border: 1px solid #cccccc; }"
+        )
+        self.session_list.itemSelectionChanged.connect(self.on_session_selected)
+        sidebar.addWidget(side_label)
+        sidebar.addWidget(self.session_list)
+
+        self.sidebar_widget = QWidget()
+        self.sidebar_widget.setLayout(sidebar)
+
+        main_col = QVBoxLayout()
+
+        top_row = QHBoxLayout()
+        self.toggle_history_btn = QPushButton("🕒")
+        self.toggle_history_btn.setToolTip("Show/Hide conversation history")
+        self.toggle_history_btn.clicked.connect(self.toggle_history)
+        top_row.addWidget(self.toggle_history_btn)
+        self.new_conv_btn = QPushButton("New Conversation")
+        self.new_conv_btn.setToolTip("Start a new conversation and clear the chat")
+        self.new_conv_btn.clicked.connect(self.new_conversation)
+        top_row.addWidget(self.new_conv_btn)
+        top_row.addStretch()
+
+        disclaimer = QLabel("⚠️ Pyra is not a substitute for professional medical advice.")
+        disclaimer.setStyleSheet("color: #BD3B00; font-weight: bold;")
+        disclaimer.setAlignment(Qt.AlignCenter)
+        top_row.addWidget(disclaimer)
+        top_row.addStretch()
+        main_col.addLayout(top_row)
+
+        self.chat_display = QTextEdit()
+        self.chat_display.setReadOnly(True)
+        self.chat_display.setStyleSheet("font-family: Consolas, 'Courier New', monospace; font-size: 12pt;")
+        main_col.addWidget(self.chat_display)
+
+        input_row = QHBoxLayout()
+        self.input_box = QLineEdit()
+        self.input_box.setPlaceholderText("Pls tell me your symptoms...")
+        self.input_box.returnPressed.connect(self.handle_send)
+        self.input_box.setStyleSheet("color: #111111; background-color: #C7E3BF; padding: 6px;")
+        input_row.addWidget(self.input_box)
+
+        self.send_btn = QPushButton("Send")
+        self.send_btn.clicked.connect(self.handle_send)
+        input_row.addWidget(self.send_btn)
+
+        main_col.addLayout(input_row)
+
+        root.addWidget(self.sidebar_widget, 1)
+        root.addLayout(main_col, 3)
+        self.setLayout(root)
+
+        self.refresh_sidebar(select_id=self.current_session["id"])
+        self.rebuild_chat_from_history()
+
+    def handle_send(self):
+        user_text = self.input_box.text().strip()
+        if not user_text:
+            return
+
+        escaped_user = html.escape(user_text)
+        self.chat_display.append(
+            f"<span style='color:#0000ff'>You:</span> "
+            f"<span style='color:#000000'>{escaped_user}</span>"
+        )
+        self.chat_display.append("")
+        self.input_box.clear()
+        self.send_btn.setEnabled(False)
+        self.input_box.setEnabled(False)
+        self.chat_display.append(
+            "<span style='color:#ff0000'>Pyra:</span> "
+            "<span style='color:#000000'>…thinking…</span>"
+        )
+
+        self._thinking_active = True
+
+        self.worker = Worker(user_text, self.history)
+        self.worker.done.connect(self.handle_reply)
+        self.worker.start()
+
+    def handle_reply(self, reply):
+        cleaned = clean_model_reply(reply)
+        cleaned = remove_redundant_opening(cleaned, self.history)
+        body_html = _format_reply_html(cleaned)
+        if getattr(self, "_thinking_active", False):
+            cursor = self.chat_display.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.select(QTextCursor.BlockUnderCursor)
+            cursor.insertHtml(
+                f"<span style='color:#ff0000'>Pyra:</span> "
+                f"{body_html}"
+            )
+            self._thinking_active = False
+        else:
+            self.chat_display.append(
+                f"<span style='color:#ff0000'>Pyra:</span> "
+                f"{body_html}"
+            )
+        lines = self.chat_display.toPlainText().splitlines()
+        last_user = ""
+        for l in reversed(lines):
+            if l.startswith("You:"):
+                last_user = l.replace("You:", "").strip()
+                break
+        self.history.append((last_user, cleaned))
+        self.save_current_session(title_hint=last_user)
+        self.send_btn.setEnabled(True)
+        self.input_box.setEnabled(True)
+
+    def new_conversation(self):
+        session = self.session_mgr.create_session()
+        self.current_session = session
+        self.history = []
+        self.refresh_sidebar(select_id=session["id"])
+        self.rebuild_chat_from_history()
+        self.input_box.clear()
+        self.send_btn.setEnabled(True)
+
+    def toggle_history(self):
+        if hasattr(self, "sidebar_widget"):
+            self.sidebar_widget.setVisible(not self.sidebar_widget.isVisible())
+
+    def refresh_sidebar(self, select_id):
+        self.session_list.blockSignals(True)
+        self.session_list.clear()
+        for s in self.session_mgr.sessions:
+            sid = s.get("id")
+            title = s.get("title", "Untitled") or "Untitled"
+            item = QListWidgetItem()
+            item.setData(Qt.UserRole, sid)
+            item.setSizeHint(QSize(0, 40))
+
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(8, 4, 6, 4)
+            row_layout.setSpacing(6)
+
+            title_label = QLabel(title)
+            title_label.setStyleSheet("font-weight: normal;")
+            row_layout.addWidget(title_label)
+            row_layout.addStretch()
+
+            delete_btn = QPushButton("🗑️")
+            delete_btn.setToolTip("Delete this conversation")
+            delete_btn.setFixedSize(32, 28)
+            delete_btn.setCursor(Qt.PointingHandCursor)
+            delete_btn.setStyleSheet(
+                "QPushButton { background-color: #FFFFFF; color: #BD3B00; border: 1px solid #cccccc; }"
+                "QPushButton::hover { background-color: #F6CDC9; }"
+            )
+            delete_btn.clicked.connect(partial(self.confirm_delete_session, sid))
+            row_layout.addWidget(delete_btn)
+
+            self.session_list.addItem(item)
+            self.session_list.setItemWidget(item, row_widget)
+        if select_id:
+            for i in range(self.session_list.count()):
+                item = self.session_list.item(i)
+                if item.data(Qt.UserRole) == select_id:
+                    self.session_list.setCurrentRow(i)
+                    break
+        self.session_list.blockSignals(False)
+
+    def on_session_selected(self):
+        item = self.session_list.currentItem()
+        if not item:
+            return
+        sid = item.data(Qt.UserRole)
+        if not sid or (self.current_session and sid == self.current_session.get("id")):
+            return
+        self.save_current_session()
+        session = self.session_mgr.find_session(sid)
+        if session is None:
+            return
+        self.current_session = session
+        self.history = list(session.get("history", []))
+        self.session_mgr.last_active_id = sid
+        self.session_mgr.save()
+        self.rebuild_chat_from_history()
+
+    def rebuild_chat_from_history(self):
+        self.chat_display.clear()
+        for user, bot in self.history:
+            escaped_user = html.escape(user if user is not None else "")
+            cleaned_bot = clean_model_reply(bot if bot is not None else "")
+            body_html = _format_reply_html(cleaned_bot)
+            self.chat_display.append(
+                f"<span style='color:#0000ff'>You:</span> "
+                f"<span style='color:#000000'>{escaped_user}</span>"
+            )
+            self.chat_display.append("")
+            self.chat_display.append(
+                f"<span style='color:#ff0000'>Pyra:</span> "
+                f"{body_html}"
+            )
+
+    def confirm_delete_session(self, sid: str):
+        session = self.session_mgr.find_session(sid)
+        title = session.get("title", "this conversation") if session else "this conversation"
+        reply = QMessageBox.question(
+            self,
+            "Delete conversation?",
+            f"Delete '{title}' permanently?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        removed = self.session_mgr.delete_session(sid)
+        if not removed:
+            QMessageBox.warning(
+                self,
+                "Conversation not found",
+                "The selected conversation could not be deleted.",
+            )
+            return
+
+        if self.current_session and self.current_session.get("id") == sid:
+            if self.session_mgr.sessions:
+                next_id = self.session_mgr.last_active_id or self.session_mgr.sessions[0]["id"]
+                self.current_session = (
+                    self.session_mgr.find_session(next_id)
+                    or self.session_mgr.sessions[0]
+                )
+                self.history = list(self.current_session.get("history", []))
+            else:
+                self.current_session = self.session_mgr.create_session()
+                self.history = []
+            self.rebuild_chat_from_history()
+
+        current_id = self.current_session.get("id") if self.current_session else None
+        self.refresh_sidebar(select_id=current_id)
+
+    def save_current_session(self, title_hint=None):
+        sid = self.current_session.get("id") if self.current_session else None
+        if not sid:
+            return
+        self.session_mgr.upsert_history(sid, self.history)
+        session = self.session_mgr.find_session(sid)
+        if session:
+            if session.get("title") == "New conversation" and self.history:
+                first_user = self.history[0][0] if self.history and self.history[0] else (title_hint or "New conversation")
+                title = (first_user[:40] + "…") if len(first_user) > 40 else first_user
+                if title.strip():
+                    self.session_mgr.update_title(sid, title)
+                    self.refresh_sidebar(select_id=sid)
+
+
+def run_app():
+    app = QApplication(sys.argv)
+    win = PyraApp()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    run_app()
