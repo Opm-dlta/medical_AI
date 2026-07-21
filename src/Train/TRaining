@@ -68,7 +68,7 @@ def main():
     else:
         print("No Hugging Face token found in environment; attempting anonymous access (may fail for gated/private models)")
  
-    train_file = r'C:\Users\Lunga\Desktop\projects\Ai\llama2-chatbot\src\data\simple-illness\mistra\processed\mts_train_mistral_rtx4070.jsonl'
+    train_file = src/Train/Train_Rtx4070.json
     valid_file = r'C:\Users\Lunga\Desktop\projects\Ai\llama2-chatbot\src\data\simple-illness\mistra\processed\mts_valid_mistral_rtx4070.jsonl'
 
     model_name = "mistralai/Mistral-7B-Instruct-v0.2"
