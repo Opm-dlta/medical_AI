@@ -9,3 +9,5 @@ pip install scikit-learn
 pip install tqdm
 pip install langchain
 pip install langchain_ollama
+pip install PyQt5
+pip install langchain-core
