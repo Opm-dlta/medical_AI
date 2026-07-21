@@ -1,1 +1,533 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+
+try:
+    import torch
+except Exception:
+    torch = None
+
+try:
+    from transformers import AutoTokenizer, pipeline
+except Exception:
+    AutoTokenizer = None
+    pipeline = None
+
+try:
+    from peft import AutoPeftModelForCausalLM
+except Exception:
+    AutoPeftModelForCausalLM = None
+
+try:
+    from langchain_ollama import OllamaLLM
+    from langchain_core.prompts import ChatPromptTemplate
+except Exception:
+    OllamaLLM = None
+    ChatPromptTemplate = None
+
+ 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(ROOT, "conversations.json")
+# Training saves the adapter to medicalfinal/ (one level up from simple-illness/)
+ADAPTER_DIR = os.path.join(ROOT, "..", "medicalfinal")
+HAS_ADAPTER = os.path.isdir(ADAPTER_DIR) and os.path.exists(os.path.join(ADAPTER_DIR, "adapter_config.json"))
+MAX_CONTEXT_TURNS = 6
+
+_MEDICAL_KEYWORDS = {
+    # symptoms
+    "ache", "aching", "allergy", "bloating", "bleed", "bleeding", "blister",
+    "blood", "breath", "breathless", "bruise", "burning", "chills", "cold",
+    "congestion", "constipation", "cough", "cramp", "dehydration", "diarrhea",
+    "discharge", "discomfort", "dizziness", "drowsy", "dry", "fatigue",
+    "fever", "faint", "flu", "headache", "heartburn", "hives", "hoarse",
+    "hunger", "inflammation", "insomnia", "itch", "itching", "lethargy",
+    "migraine", "nausea", "numbness", "pain", "paleness", "palpitation",
+    "rash", "reflux", "runny", "shivering", "shortness", "sneeze", "sneezing",
+    "sore", "spasm", "stiff", "stiffness", "stomachache", "stomach", "swelling",
+    "swollen", "tender", "thirst", "throat", "tingling", "tired", "tiredness",
+    "ulcer", "urination", "vomit", "vomiting", "weakness", "wheeze", "wheezing",
+    "wound",
+    # conditions
+    "anemia", "anxiety", "appendicitis", "arthritis", "asthma", "bronchitis",
+    "burn", "cancer", "chickenpox", "cholesterol", "cold", "conjunctivitis",
+    "covid", "dengue", "depression", "diabetes", "eczema", "food", "fracture",
+    "gerd", "gastritis", "hernia", "hypertension", "hypothyroid", "infection",
+    "injury", "malaria", "measles", "obesity", "osteoporosis", "pneumonia",
+    "psoriasis", "scabies", "sinusitis", "sprain", "stress", "stroke",
+    "thyroid", "typhoid", "uti", "vertigo",
+    # medical context
+    "antibiotic", "antiviral", "clinic", "diagnose", "diagnosis", "doctor",
+    "dosage", "drug", "emergency", "health", "hospital", "medication",
+    "medicine", "nurse", "painkiller", "pharmacy", "physician", "prescription",
+    "prognosis", "remedy", "specialist", "supplement", "surgery", "symptom",
+    "therapy", "treatment", "vaccine", "vitamin",
+}
+
+_lora_pipeline = None
+_lora_tokenizer = None
+_lora_error = None
+
+train_data = []
+if os.path.exists(DATA_PATH):
+    try:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            train_data = json.load(f)
+    except Exception:
+        train_data = []
+
+
+def _ensure_lora_pipeline():
+    global _lora_pipeline, _lora_tokenizer, _lora_error
+    if _lora_pipeline is not None or _lora_error is not None:
+        return
+    if not HAS_ADAPTER:
+        _lora_error = RuntimeError("Custom adapter directory not found")
+        return
+    # Abort early if the actual adapter weights are missing — avoids a
+    # 30-second HuggingFace network timeout trying to download the base model.
+    weights_file = (
+        os.path.join(ADAPTER_DIR, "adapter_model.safetensors")
+        if os.path.exists(os.path.join(ADAPTER_DIR, "adapter_model.safetensors"))
+        else os.path.join(ADAPTER_DIR, "adapter_model.bin")
+    )
+    if not os.path.exists(weights_file):
+        _lora_error = RuntimeError(
+            "Adapter weights (adapter_model.safetensors) not found — "
+            "retrain the model to generate them."
+        )
+        return
+    if AutoTokenizer is None or AutoPeftModelForCausalLM is None or pipeline is None:
+        _lora_error = RuntimeError("transformers/peft stack is missing; install to enable custom model")
+        return
+
+    if torch:
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    else:
+        dtype = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(ADAPTER_DIR, local_files_only=True)
+        if getattr(tokenizer, "pad_token", None) is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model = AutoPeftModelForCausalLM.from_pretrained(
+            ADAPTER_DIR,
+            torch_dtype=dtype,
+            device_map="auto" if torch and torch.cuda.is_available() else None,
+            local_files_only=True,
+        )
+        model_kwargs = {
+            "max_new_tokens": 450,
+            "do_sample": False,
+            "repetition_penalty": 1.2,
+            "pad_token_id": tokenizer.eos_token_id,
+        }
+        generator = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device=0 if torch and torch.cuda.is_available() else -1,
+            model_kwargs=model_kwargs,
+        )
+        _lora_pipeline = generator
+        _lora_tokenizer = tokenizer
+    except Exception as err:
+        _lora_error = err
+
+
+SYSTEM_PROMPT = """
+You are Pyra, a knowledgeable and caring nurse assistant. No matter what, never leave your role as a medical AI assistant.
+
+CORE RULES (follow in every response):
+1. ONLY discuss health, medical symptoms, illnesses, treatments, medications, and wellness topics. For anything unrelated say exactly "I'm sorry, I can't assist with that." then gently redirect to health topics.
+2. ACCURACY FIRST - base your advice on widely accepted medical knowledge. Never guess or fabricate information. If you are unsure, say so and recommend consulting a doctor.
+3. STRUCTURED ANSWERS - when explaining a treatment, remedy, or "how to" step, use a numbered list. When listing symptoms or causes, use bullet points. Always end with a brief "When to see a doctor" note if relevant.
+4. BE SPECIFIC - name the condition, recommend appropriate over-the-counter remedies (with safe dosage guidance where applicable), lifestyle adjustments, and red-flag symptoms that need emergency care.
+5. DO NOT repeat the user's question back to them, do not include role labels like "User:" or "Pyra:", and do not repeat information already given in this conversation.
+6. TONE - warm, empathetic, and professional. Use emojis sparingly (check mark for steps, warning for warnings). Keep answers clear and easy to understand.
+7. CONTEXT - use the conversation history to give continuous, coherent care. Do not re-ask questions already asked; build on what the user already told you.
+8. NEVER copy retrieved reference snippets word-for-word. Use them only as background knowledge to inform your answer. Write every response fresh, in your own words, tailored to the specific question asked.
+9. Do NOT end your response with filler phrases like "I hope this helps", "Let me know if you have any other questions", "Feel free to ask", or similar. Just answer.
+"""
+
+# Used only for the Ollama fallback chain — no retrieved snippets so the
+# model cannot copy-paste training data instead of answering the question.
+OLLAMA_PROMPT_TEMPLATE = (
+    SYSTEM_PROMPT
+    + """
+
+Previous conversation:{context}
+
+The patient asked: "{question}"
+
+CRITICAL: Read what the patient SPECIFICALLY asked. If they asked "is X common?", "is X normal?", or "does X happen?", answer YES or NO first and explain why, THEN give advice only if relevant. Do NOT open with a generic treatment list if the question is about whether something is normal or common.
+
+Pyra's answer:"""
+)
+
+chain = None
+_model_load_error = None
+
+
+def find_relevant_example(user_question):
+    for item in train_data:
+        try:
+            if user_question.lower() in item.get("prompt", "").lower():
+                return item.get("response", "")
+        except Exception:
+            continue
+    return ""
+
+
+def _normalize(text: str):
+    t = (text or "").lower()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    return [w for w in t.split() if w]
+
+
+def retrieve_snippets(user_question: str, k: int = 5, max_chars: int = 1600) -> str:
+    """Return the top-k most relevant training snippets using Jaccard similarity.
+
+    Jaccard = |intersection| / |union| penalises verbose documents that happen
+    to share a few common words, surfacing concise, on-topic matches instead.
+    """
+    if not train_data:
+        return ""
+    q_tokens = set(_normalize(user_question))
+    if not q_tokens:
+        return ""
+    scored = []
+    for item in train_data:
+        try:
+            prompt_toks = set(_normalize(item.get("prompt", "")))
+            resp_toks = set(_normalize(item.get("response", "")))
+            doc_toks = prompt_toks | resp_toks
+            if not doc_toks:
+                continue
+            intersection = q_tokens & doc_toks
+            if not intersection:
+                continue
+            # Jaccard similarity (higher = better match)
+            jaccard = len(intersection) / len(q_tokens | doc_toks)
+            # Prefer items whose *prompt* matches (question-level relevance)
+            prompt_bonus = len(q_tokens & prompt_toks) / max(len(q_tokens), 1)
+            score = jaccard + 0.5 * prompt_bonus
+            # Only pass the *response* to the model — avoids echoing the training question back
+            body = item.get("response", "").strip()
+            scored.append((score, body))
+        except Exception:
+            continue
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: x[0], reverse=True)
+    lines = []
+    total = 0
+    for _, body in scored[:k]:
+        snippet = body.replace("\r", " ").replace("\n", " ")
+        snippet = snippet[:400].strip()
+        if snippet:
+            line = f"- {snippet}"
+            if total + len(line) + (1 if lines else 0) > max_chars:
+                break
+            lines.append(line)
+            total += len(line) + (1 if lines else 0)
+    return "\n".join(lines)
+
+
+def _is_medical(text: str) -> bool:
+    tokens = set(_normalize(text))
+    return any(tok in _MEDICAL_KEYWORDS for tok in tokens)
+
+#maybe take out 
+_OFF_TOPIC_PATTERNS = re.compile(
+    r"\b("
+    r"who (?:won|scored|played|is the president|is the prime|invented|wrote|made|directed|sang|won)"
+    r"|what (?:is the capital|is the currency|year did|sport|movie|song|album|country)"
+    r"|how (?:tall is|old is|rich is|many goals|many points|far is)"
+    r"|(?:tell me (?:a )?(?:joke|story|fact|fun fact))"
+    r"|(?:weather|forecast|temperature) (?:in|today|tomorrow)"
+    r"|(?:recipe|ingredients|cook|bake|fry) (?:for|a|the)"
+    r"|(?:stock|price|crypto|bitcoin|forex|exchange rate)"
+    r"|(?:translate|how do you say)"
+    r"|(?:write (?:a |an )?(?:poem|essay|story|code|function|script|email|letter))"
+    r"|(?:play|sing|draw|paint)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_REFUSAL = (
+    "I'm sorry, I can't assist with that. 😊 "
+    "I'm Pyra, your medical assistant — I'm here to help with health questions, "
+    "symptoms, medications, and general wellness. "
+    "Is there anything health-related I can help you with today?"
+)
+
+
+def _guard_topic(user_question: str, history=None) -> str | None:
+    """Return a refusal string if the question is clearly non-medical, else None.
+
+    Only the explicit _OFF_TOPIC_PATTERNS are hard-blocked — keyword absence alone
+    is NOT enough to block, because typos ("diareah"), follow-up questions
+    ("is it normal if it looks yellow?") and symptom descriptions in plain language
+    all fail keyword matching while being completely legitimate medical queries.
+    The system prompt handles anything borderline that reaches the LLM.
+    """
+    text = user_question.strip()
+    if not text:
+        return None
+    # Always allow follow-ups when there is an active medical conversation
+    if history:
+        for _, bot in reversed((history or [])[-3:]):
+            if bot and _is_medical(bot):
+                return None
+  # Hard block: explicit off-topic patterns only  
+    if _OFF_TOPIC_PATTERNS.search(text):
+        return _REFUSAL
+    return None
+
+
+def _recent_history(history, limit=MAX_CONTEXT_TURNS):
+    if not history or limit <= 0:
+        return []
+    return history[-limit:]
+
+
+def _select_relevant_history(history, user_question):
+    recent = _recent_history(history)
+    if not recent:
+        return []
+    # Always keep the most recent turn regardless of topic — the user may be
+    # asking a follow-up that has no medical keywords but still depends on it
+    # (e.g. "how long does it last?" after "I have a headache").
+    last_turn = recent[-1:]
+    if not _is_medical(user_question):
+        return recent
+    medical_only = [pair for pair in recent if pair and _is_medical(pair[0] or "")]
+    if not medical_only:
+        return last_turn
+    # Ensure the very last turn is always present even if non-medical
+    if recent[-1] not in medical_only:
+        medical_only = medical_only + last_turn
+    return medical_only
+
+
+def _build_chat_messages(user_question: str, history, retrieved: str):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT.strip()}]
+    for user, bot in _select_relevant_history(history, user_question):
+        if user:
+            messages.append({"role": "user", "content": str(user)})
+        if bot:
+            messages.append({"role": "assistant", "content": str(bot)})
+
+    content = user_question.strip()
+    if retrieved:
+        content += f"\n\nRetrieved context:\n{retrieved}"
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
+def _truncate_at_next_turn(text: str) -> str:
+    """Cut off only when the model starts simulating a full dialogue exchange.
+
+    Requires a blank line before the role label so single-newline prose like
+    'For the patient: rest...' or 'Question: should you...' is never truncated.
+    Only 'user:' and 'human:' are matched — 'patient', 'question' and 'you'
+    appear too often in legitimate medical advice to be safe triggers.
+    """
+    m = re.search(r"\n{2,}(?:user|human)\s*:", text, re.IGNORECASE)
+    if m:
+        return text[: m.start()].strip()
+    return text
+
+
+def _strip_question_echo(text: str, user_question: str) -> str:
+    """Remove the user's question if the model echoed it at the start of its reply."""
+    if not text or not user_question:
+        return text
+    # Normalise both to lowercase for comparison
+    norm_reply = text.lower().lstrip()
+    norm_q = user_question.lower().strip()
+    # Check first 60 chars of the reply against first 60 chars of the question
+    if norm_reply[: min(60, len(norm_q))].startswith(norm_q[: min(60, len(norm_q))]):
+        return text[len(norm_q) :].lstrip(" :.\\-\n")
+    return text
+
+
+def sanitize_bot_text(text: str) -> str:
+    if not text:
+        return ""
+    pattern = re.compile(
+        r"^\s*(?:\*\*|\*|_|`|\(|\[)?\s*(pyra|assistant|bot)\s*(?:\*\*|\*|_|`|\)|\])?\s*[:\-–—]\s*",
+        re.IGNORECASE,
+    )
+    prev = None
+    while prev != text:
+        prev = text
+        text = pattern.sub("", text)
+    return text
+
+
+def _dedupe_paragraphs(text: str) -> str:
+    paragraphs = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
+    seen = set()
+    ordered = []
+    for para in paragraphs:
+        key = para.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(para)
+    if not ordered:
+        return text.strip()
+    if len(ordered) == len(paragraphs):
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        seen_sent = set()
+        filtered = []
+        for sentence in sentences:
+            key = sentence.lower()
+            if key in seen_sent:
+                continue
+            seen_sent.add(key)
+            filtered.append(sentence)
+        return " ".join(filtered)
+    return "\n\n".join(ordered)
+
+
+_FILLER_TAIL = re.compile(
+    r"[\s,\.]*"
+    r"(?:i hope this (?:helps|answers|was helpful)[^.!?]*[.!?]?"
+    r"|let me know (?:if you have|should you have)[^.!?]*[.!?]?"
+    r"|feel free to (?:ask|reach out)[^.!?]*[.!?]?"
+    r"|don'?t hesitate to (?:ask|reach out)[^.!?]*[.!?]?"
+    r"|please (?:consult|see|visit) (?:a|your)[^.!?]*[.!?]?"
+    r"|if you (?:have|need) (?:any )?(?:more|further|additional) (?:questions?|concerns?|help)[^.!?]*[.!?]?"
+    r")"
+    r"[\s😊🙂]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_filler_tail(text: str) -> str:
+    """Remove training-data closing filler phrases and trailing emojis."""
+    prev = None
+    while prev != text:
+        prev = text
+        text = _FILLER_TAIL.sub("", text).rstrip()
+    # Strip any stray trailing emojis left after filler removal
+    text = re.sub(r"[\s😊🙂😃😄🤗]+$", "", text).rstrip()
+    return text
+
+
+def clean_model_reply(text: str, user_question: str = "") -> str:
+    t = (text or "")
+    # Strip next-turn simulation before anything else
+    t = _truncate_at_next_turn(t)
+    # Strip leading "Answer:" / "Response:" the prompt template may leak
+    t = re.sub(r"^(?:answer|response)\s*:\s*", "", t, flags=re.IGNORECASE)
+    if t.lstrip().lower().startswith(("user:", "you:")):
+        m = re.search(r"(?i)(pyra|assistant|bot)\s*:\s*", t)
+        if m:
+            t = t[m.end():]
+        else:
+            lines = t.splitlines()
+            t = "\n".join(lines[1:]) if len(lines) > 1 else ""
+    t = sanitize_bot_text(t)
+    # Strip question echo after role-label cleanup
+    if user_question:
+        t = _strip_question_echo(t, user_question)
+    t = _strip_filler_tail(t)
+    t = t.strip()
+    return _dedupe_paragraphs(t)
+
+
+def _first_sentence(text: str) -> str:
+    if not text:
+        return ""
+    m = re.split(r"(?<=[.!?])\s+", text.strip(), maxsplit=1)
+    return m[0].strip() if m else text.strip()
+
+
+def remove_redundant_opening(new_text: str, history) -> str:
+    if not new_text:
+        return new_text
+    last_bot = None
+    for u, b in reversed(history or []):
+        if b:
+            last_bot = b
+            break
+    if not last_bot:
+        return new_text
+    s_new = _first_sentence(new_text).lower()
+    s_old = _first_sentence(last_bot).lower()
+    if not s_new or not s_old:
+        return new_text
+    prefix_len = 0
+    for a, c in zip(s_new, s_old):
+        if a == c:
+            prefix_len += 1
+        else:
+            break
+    if s_new == s_old or prefix_len >= 20:
+        parts = re.split(r"(?<=[.!?])\s+", new_text.strip(), maxsplit=1)
+        return parts[1].strip() if len(parts) > 1 else ""
+    return new_text
+
+
+def generate_response(user_question, history):
+    global chain, _model_load_error, _lora_error
+
+    # Hard topic gate — returns immediately without touching the model
+    refusal = _guard_topic(user_question, history)
+    if refusal:
+        return refusal
+
+    # Only compute RAG snippets if the fine-tuned LoRA model is available.
+    # For the Ollama fallback we rely entirely on the base model's built-in
+    # medical knowledge — injecting training snippets causes copy-paste echoing.
+    _ensure_lora_pipeline()
+    use_lora = _lora_pipeline is not None and _lora_tokenizer is not None and _lora_error is None
+    retrieved = retrieve_snippets(user_question) if use_lora else ""
+
+    if use_lora:
+        messages = _build_chat_messages(user_question, history, retrieved)
+        try:
+            prompt_text = _lora_tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            generations = _lora_pipeline(
+                prompt_text,
+                max_new_tokens=450,
+                do_sample=False,
+                repetition_penalty=1.2,
+                return_full_text=False,
+            )
+            if generations and generations[0].get("generated_text"):
+                raw = generations[0]["generated_text"].strip()
+                return clean_model_reply(raw, user_question)
+        except Exception as err:
+            _lora_error = err
+
+    if chain is None:
+        if OllamaLLM is None or ChatPromptTemplate is None:
+            message = "Custom adapter failed to load"
+            if _lora_error:
+                message += f": {_lora_error}"
+            raise RuntimeError(message)
+        try:
+            # temperature=0.35 — low enough to stay on-topic, high enough to
+            # generate a fresh answer rather than copying retrieved snippets.
+            model = OllamaLLM(model="llama2:7b-chat-q4_K_M", temperature=0.5, num_predict=600)
+            prompt = ChatPromptTemplate.from_template(OLLAMA_PROMPT_TEMPLATE)
+            chain = prompt | model
+        except Exception as e:
+            _model_load_error = e
+            raise RuntimeError(f"Model load failed: {e}")
+
+    context = ""
+    for h in _select_relevant_history(history, user_question):
+        context += f"\nUser: {h[0]}\nPyra: {h[1]}"
+    result = chain.invoke({"context": context, "question": user_question})
+    return clean_model_reply(str(result), user_question)
 
